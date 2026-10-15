@@ -374,9 +374,23 @@ function computeBaselineRMSE(split) {
  * @returns {number} predicted rating in `[1, 5]`
  */
 function predictRating(userId, movieId) {
-  // TODO(hw5): gather the two factor rows, take their dot product, add
-  // globalMean and clamp the result to [1, 5].
-  throw new Error("TODO(hw5): predictRating is not implemented yet.");
+  if (!model) return 0;
+
+  const u = Math.trunc(Number(userId));
+  const i = Math.trunc(Number(movieId));
+  const uRows = model.userFactors.shape[0];
+  const iRows = model.itemFactors.shape[0];
+  if (!Number.isFinite(u) || !Number.isFinite(i) || u < 0 || u >= uRows || i < 0 || i >= iRows) {
+    return model.globalMean;
+  }
+
+  const f = model.userFactors.shape[1];
+  return tf.tidy(() => {
+    const userRow = model.userFactors.slice([u, 0], [1, f]);
+    const itemRow = model.itemFactors.slice([i, 0], [1, f]);
+    const dot = userRow.mul(itemRow).sum().dataSync()[0];
+    return clamp(model.globalMean + dot, 1, 5);
+  });
 }
 
 /**
@@ -408,8 +422,23 @@ function predictRating(userId, movieId) {
  * @returns {Model}
  */
 function initializeFactors(train, numFactors = NUM_FACTORS) {
-  // TODO(hw5): compute globalMean, create the two tf.Variables, assign to model.
-  throw new Error("TODO(hw5): initializeFactors is not implemented yet.");
+  const rows = Array.isArray(train) ? train : [];
+  const globalMean = rows.length
+    ? rows.reduce((acc, r) => acc + r.rating, 0) / rows.length
+    : 0;
+
+  if (model) {
+    tf.dispose([model.userFactors, model.itemFactors]);
+    model = null;
+  }
+
+  const maxMovieId = movies.reduce((max, m) => Math.max(max, m.id), 0);
+  model = {
+    userFactors: tf.tidy(() => tf.variable(tf.randomNormal([numUsers + 1, numFactors], 0, 0.05))),
+    itemFactors: tf.tidy(() => tf.variable(tf.randomNormal([maxMovieId + 1, numFactors], 0, 0.05))),
+    globalMean,
+  };
+  return model;
 }
 
 /**
@@ -462,8 +491,88 @@ function initializeFactors(train, numFactors = NUM_FACTORS) {
  * @returns {HistoryRow[]}
  */
 function trainMF(train, val, opts) {
-  // TODO(hw5): batched tensor training loop; update model in place; return history.
-  throw new Error("TODO(hw5): trainMF is not implemented yet.");
+  trainingHistory = [];
+  const rows = Array.isArray(train) ? train : [];
+  if (!model || rows.length === 0) return trainingHistory;
+
+  const {
+    epochs = 1,
+    lr = 0.01,
+    reg = 0,
+    batchSize = rows.length,
+  } = opts || {};
+  const nEpochs = Math.max(1, Math.round(epochs));
+  const size = Math.max(1, Math.round(batchSize));
+
+  const optimizer = tf.train.adam(lr);
+  const order = new Array(rows.length);
+  let bestVal = Infinity;
+  let bestUser = null;
+  let bestItem = null;
+
+  try {
+    for (let epoch = 1; epoch <= nEpochs; epoch++) {
+      for (let k = 0; k < order.length; k++) order[k] = k;
+      for (let k = order.length - 1; k > 0; k--) {
+        const j = Math.floor(Math.random() * (k + 1));
+        const swap = order[k];
+        order[k] = order[j];
+        order[j] = swap;
+      }
+
+      for (let start = 0; start < rows.length; start += size) {
+        const end = Math.min(start + size, rows.length);
+        const n = end - start;
+        const userIdx = new Int32Array(n);
+        const itemIdx = new Int32Array(n);
+        const targets = new Float32Array(n);
+        for (let k = 0; k < n; k++) {
+          const r = rows[order[start + k]];
+          userIdx[k] = r.userId;
+          itemIdx[k] = r.movieId;
+          targets[k] = r.rating;
+        }
+
+        optimizer.minimize(
+          () =>
+            tf.tidy(() => {
+              const uIdx = tf.tensor1d(userIdx, "int32");
+              const iIdx = tf.tensor1d(itemIdx, "int32");
+              const u = tf.gather(model.userFactors, uIdx);
+              const i = tf.gather(model.itemFactors, iIdx);
+              const pred = tf.sum(u.mul(i), 1).add(model.globalMean);
+              const mse = tf.losses.meanSquaredError(tf.tensor1d(targets, "float32"), pred);
+              const l2 = u.square().sum().add(i.square().sum()).mul(reg).div(n);
+              return mse.add(l2);
+            }),
+          false,
+          [model.userFactors, model.itemFactors],
+        );
+      }
+
+      const trainRMSE = computeRMSEFor(train);
+      const valRMSE = computeRMSEFor(val);
+      trainingHistory.push({ epoch, trainRMSE, valRMSE });
+
+      if (valRMSE < bestVal) {
+        bestVal = valRMSE;
+        if (bestUser) bestUser.dispose();
+        if (bestItem) bestItem.dispose();
+        bestUser = model.userFactors.clone();
+        bestItem = model.itemFactors.clone();
+      }
+    }
+
+    if (bestUser && bestItem) {
+      model.userFactors.assign(bestUser);
+      model.itemFactors.assign(bestItem);
+    }
+  } finally {
+    if (bestUser) bestUser.dispose();
+    if (bestItem) bestItem.dispose();
+    optimizer.dispose();
+  }
+  return trainingHistory;
 }
 
 /**
@@ -481,8 +590,12 @@ function trainMF(train, val, opts) {
  * @returns {HistoryRow|null}
  */
 function selectBestCheckpoint(history) {
-  // TODO(hw5): scan for the minimum valRMSE, breaking ties toward the earliest epoch.
-  throw new Error("TODO(hw5): selectBestCheckpoint is not implemented yet.");
+  if (!Array.isArray(history) || history.length === 0) return null;
+  let best = history[0];
+  for (let i = 1; i < history.length; i++) {
+    if (history[i].valRMSE < best.valRMSE) best = history[i];
+  }
+  return best;
 }
 
 /**
